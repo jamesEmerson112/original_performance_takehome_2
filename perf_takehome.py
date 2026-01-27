@@ -89,21 +89,21 @@ class KernelBuilder:
         """Add a packed VLIW instruction bundle"""
         self.instrs.append(instr_dict)
 
-    def emit_vectorized_hash(self, v_hash, v_tmp1, v_tmp2):
+    def emit_vectorized_hash(self, v_hash, v_tmp1, v_tmp2, v_hash_consts):
         """
         Emit vectorized hash for 8 elements.
         6 stages x 3 ops = 18 valu ops.
-        Pack 6 ops per cycle (max VALU slots).
+
+        v_hash_consts: list of (v_c1, v_c3) vector constant addresses for each stage
         """
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            c1 = self.scratch_const(val1)
-            c3 = self.scratch_const(val3)
+            v_c1, v_c3 = v_hash_consts[hi]
             # Stage: tmp1 = hash op1 c1, tmp2 = hash op3 c3, hash = tmp1 op2 tmp2
             # Pack first two ops together
             self.add_packed({
                 "valu": [
-                    (op1, v_tmp1, v_hash, c1),
-                    (op3, v_tmp2, v_hash, c3),
+                    (op1, v_tmp1, v_hash, v_c1),
+                    (op3, v_tmp2, v_hash, v_c3),
                 ]
             })
             # Then the combining op
@@ -116,14 +116,13 @@ class KernelBuilder:
         Compute next index for 8 elements:
         idx = 2*idx + (1 if val%2==0 else 2)
         idx = 0 if idx >= n_nodes else idx
-        """
-        two_const = self.scratch_const(2)
-        zero_const = self.scratch_const(0)
 
-        # tmp1 = val % 2
-        self.add_packed({"valu": [("%", v_tmp1, v_val, two_const)]})
-        # tmp1 = (tmp1 == 0)
-        self.add_packed({"valu": [("==", v_tmp1, v_tmp1, zero_const)]})
+        All inputs must be vector addresses (VLEN elements each).
+        """
+        # tmp1 = val % 2 (using vector v_two)
+        self.add_packed({"valu": [("%", v_tmp1, v_val, v_two)]})
+        # tmp1 = (tmp1 == 0) (using vector v_zero)
+        self.add_packed({"valu": [("==", v_tmp1, v_tmp1, v_zero)]})
         # tmp2 = select(tmp1, 1, 2) - if val%2==0 then 1, else 2
         self.add_packed({"flow": [("vselect", v_tmp2, v_tmp1, v_one, v_two)]})
         # idx = idx * 2
@@ -135,31 +134,35 @@ class KernelBuilder:
         # idx = select(tmp1, idx, 0) - wrap to 0 if >= n_nodes
         self.add_packed({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
 
-    def emit_vselect_cascade(self, v_result, v_idx, cache_base, unique_indices_base,
-                              unique_count, v_tmp_idx, v_tmp_val, v_cond):
+    def emit_vselect_from_prebroadcast(self, v_result, v_idx, v_cache_broadcast,
+                                         v_start_idx, unique_count, v_tmps, v_cond, v_zero, v_cmp_consts):
         """
-        For each lane, select the cached node value matching that lane's index.
-        Uses vselect cascade - O(unique_count) FLOW operations.
+        Select from pre-broadcast cache values using cascade.
+        v_cache_broadcast: array of pre-broadcast vector values (unique_count × VLEN words)
+        v_start_idx: pre-broadcast start_idx vector
+        v_zero: pre-broadcast vector of zeros (for copying)
+        v_cmp_consts: pre-broadcast comparison constants [0, 1, 2, ..., 31] × VLEN
+        """
+        if unique_count == 1:
+            # Just copy the single pre-broadcast value
+            self.add_packed({"valu": [("+", v_result, v_cache_broadcast, v_zero)]})
+            return
 
-        v_result: output vector (8 elements)
-        v_idx: input index vector (8 elements)
-        cache_base: scratch address of cached node values
-        unique_indices_base: scratch address of unique index list
-        unique_count: number of unique indices
-        """
-        # Initialize result with first cache entry (broadcast)
-        self.add_packed({"valu": [("vbroadcast", v_result, cache_base)]})
+        v_offset = v_tmps[0]
+
+        # Compute offset = v_idx - start_idx
+        self.add_packed({"valu": [("-", v_offset, v_idx, v_start_idx)]})
+
+        # Initialize result with first cache entry
+        self.add_packed({"valu": [("+", v_result, v_cache_broadcast, v_zero)]})
 
         # For each unique index > 0, conditionally update
+        # Using pre-broadcast comparison constants (no broadcasts in this loop!)
         for u in range(1, unique_count):
-            # Broadcast unique index u
-            self.add_packed({"valu": [("vbroadcast", v_tmp_idx, unique_indices_base + u)]})
-            # Broadcast cache value u
-            self.add_packed({"valu": [("vbroadcast", v_tmp_val, cache_base + u)]})
-            # Check which lanes match this unique index
-            self.add_packed({"valu": [("==", v_cond, v_idx, v_tmp_idx)]})
-            # Update result for matching lanes
-            self.add_packed({"flow": [("vselect", v_result, v_cond, v_tmp_val, v_result)]})
+            # Compare offset against pre-broadcast u
+            self.add_packed({"valu": [("==", v_cond, v_offset, v_cmp_consts + u * VLEN)]})
+            # vselect: if offset==u, use cache[u], else keep current result
+            self.add_packed({"flow": [("vselect", v_result, v_cond, v_cache_broadcast + u * VLEN, v_result)]})
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -202,11 +205,15 @@ class KernelBuilder:
         v_indices = self.alloc_scratch("v_indices", batch_size)
         v_values = self.alloc_scratch("v_values", batch_size)
 
-        # Node cache for unique values (max 256)
-        node_cache = self.alloc_scratch("node_cache", 256)
+        # Pre-broadcast cache for unique node values (max 32 unique × VLEN = 256 words)
+        # This allows us to broadcast once per round instead of per chunk
+        v_cache_broadcast = self.alloc_scratch("v_cache_broadcast", 32 * VLEN)
 
-        # Unique indices list
-        unique_indices = self.alloc_scratch("unique_indices", 256)
+        # Temporary for start_idx broadcast (used in offset computation)
+        v_start_idx = self.alloc_scratch("v_start_idx", VLEN)
+
+        # Scalar cache for loading node values before broadcasting
+        node_cache_scalar = self.alloc_scratch("node_cache_scalar", 32)
 
         # Vector temporaries
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
@@ -221,11 +228,34 @@ class KernelBuilder:
         v_two = self.alloc_scratch("v_two", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
+        # Vector constants for hash stages (6 stages × 2 constants each)
+        v_hash_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            v_c1 = self.alloc_scratch(f"v_hash_c1_{hi}", VLEN)
+            v_c3 = self.alloc_scratch(f"v_hash_c3_{hi}", VLEN)
+            v_hash_consts.append((v_c1, v_c3))
+
+        # Pre-broadcast comparison constants 0-31 for vselect cascade (key optimization!)
+        v_cmp_consts = self.alloc_scratch("v_cmp_consts", 32 * VLEN)
+
         # Broadcast constants to vectors
         self.add_packed({"valu": [("vbroadcast", v_zero, zero_const)]})
         self.add_packed({"valu": [("vbroadcast", v_one, one_const)]})
         self.add_packed({"valu": [("vbroadcast", v_two, two_const)]})
         self.add_packed({"valu": [("vbroadcast", v_n_nodes, self.scratch["n_nodes"])]})
+
+        # Broadcast hash constants to vectors
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1 = self.scratch_const(val1)
+            c3 = self.scratch_const(val3)
+            v_c1, v_c3 = v_hash_consts[hi]
+            self.add_packed({"valu": [("vbroadcast", v_c1, c1)]})
+            self.add_packed({"valu": [("vbroadcast", v_c3, c3)]})
+
+        # Broadcast comparison constants 0-31 (done once at kernel start)
+        for i in range(32):
+            i_const = self.scratch_const(i)
+            self.add_packed({"valu": [("vbroadcast", v_cmp_consts + i * VLEN, i_const)]})
 
         # ===== INITIALIZATION: Load all indices/values into scratch =====
         for chunk in range(n_vectors):
@@ -259,15 +289,21 @@ class KernelBuilder:
                 # Depth d: idx (2^d - 1) to (2^(d+1) - 2)
                 start_idx = (1 << gather_depth) - 1
 
-                # Load unique node values into cache
+                # Load unique node values and pre-broadcast them (once per round)
                 for u in range(unique_count):
                     tree_idx = start_idx + u
-                    # Store the expected index in unique_indices
-                    self.add_packed({"load": [("const", unique_indices + u, tree_idx)]})
-                    # addr = forest_values_p + tree_idx
+                    # Load node value into scalar cache
                     self.add_packed({"load": [("const", tmp_addr, tree_idx)]})
                     self.add_packed({"alu": [("+", tmp_addr, self.scratch["forest_values_p"], tmp_addr)]})
-                    self.add_packed({"load": [("load", node_cache + u, tmp_addr)]})
+                    self.add_packed({"load": [("load", node_cache_scalar + u, tmp_addr)]})
+
+                # Pre-broadcast all cache values (key optimization: done once per round)
+                for u in range(unique_count):
+                    self.add_packed({"valu": [("vbroadcast", v_cache_broadcast + u * VLEN, node_cache_scalar + u)]})
+
+                # Broadcast start_idx for offset computation
+                start_const = self.scratch_const(start_idx)
+                self.add_packed({"valu": [("vbroadcast", v_start_idx, start_const)]})
 
                 # Process each vector chunk
                 for chunk in range(n_vectors):
@@ -275,20 +311,20 @@ class KernelBuilder:
                     v_val = v_values + chunk * VLEN
 
                     if unique_count == 1:
-                        # Depth 0: Just broadcast the single cached value
-                        self.add_packed({"valu": [("vbroadcast", v_node_val, node_cache)]})
+                        # Depth 0: Copy the single pre-broadcast value using vector add with v_zero
+                        self.add_packed({"valu": [("+", v_node_val, v_cache_broadcast, v_zero)]})
                     else:
-                        # Use vselect cascade to pick correct cache entry
-                        self.emit_vselect_cascade(
-                            v_node_val, v_idx, node_cache, unique_indices,
-                            unique_count, v_tmp1, v_tmp2, v_cond
+                        # Use vselect with pre-broadcast cache and comparison constants
+                        self.emit_vselect_from_prebroadcast(
+                            v_node_val, v_idx, v_cache_broadcast,
+                            v_start_idx, unique_count, [v_tmp1, v_tmp2, v_tmp3], v_cond, v_zero, v_cmp_consts
                         )
 
                     # XOR: val = val ^ node_val
                     self.add_packed({"valu": [("^", v_val, v_val, v_node_val)]})
 
                     # Hash
-                    self.emit_vectorized_hash(v_val, v_tmp1, v_tmp2)
+                    self.emit_vectorized_hash(v_val, v_tmp1, v_tmp2, v_hash_consts)
 
                     # Compute next index
                     self.emit_compute_next_index(
@@ -357,7 +393,7 @@ class KernelBuilder:
                     self.add_packed({"valu": [("^", v_val, v_val, v_node_val)]})
 
                     # Hash
-                    self.emit_vectorized_hash(v_val, v_tmp1, v_tmp2)
+                    self.emit_vectorized_hash(v_val, v_tmp1, v_tmp2, v_hash_consts)
 
                     # Compute next index
                     self.emit_compute_next_index(
