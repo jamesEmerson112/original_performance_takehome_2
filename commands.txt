@@ -1,0 +1,11 @@
+# See your current cycle count
+python perf_takehome.py Tests.test_kernel_cycles
+
+# Check which performance thresholds you've passed
+python tests/submission_tests.py
+
+# Generate a trace file for visualization
+python perf_takehome.py Tests.test_kernel_trace
+
+# Start the trace visualization server (then open browser)
+python watch_trace.py
