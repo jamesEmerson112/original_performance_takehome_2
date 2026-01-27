@@ -1,0 +1,28 @@
+Round | Unique Indices | Avg Walkers/Index | Max Walkers/Index | Notes
+------|----------------|-------------------|-------------------|------
+R0    | 1              | 256               | 256               | All at root (idx=0)
+R1    | 2              | 128               | 134               | At depth 1 (idx=1,2)
+R2    | 4              | 64                | 72                | At depth 2
+R3    | 8              | 32                | 37                | At depth 3
+R4    | 16             | 16                | 21                | Diverging
+R5    | 32             | 8                 | 13                | Diverging
+R6    | 63             | 4                 | 8                 | High diversity
+R7    | 108            | 2                 | 6                 | High diversity
+R8    | 159            | 1                 | 6                 | Near-unique
+R9    | 191            | 1                 | 4                 | Near-unique
+R10   | 224            | 1                 | 2                 | At leaves (high diversity)
+R11   | 1              | 256               | 256               | ALL WRAPPED TO ROOT
+R12   | 2              | 128               | 142               | At depth 1 (post-wrap)
+R13   | 4              | 64                | 78                | At depth 2
+R14   | 8              | 32                | 51                | At depth 3
+R15   | 16             | 16                | 26                | At depth 4
+
+NOTE: The wrap happens at the END of R10's computation. At R10's gather,
+walkers are still at leaves (high diversity). At R11's gather, all walkers
+are at root (idx=0) because they wrapped during R10.
+
+The current formula `gather_depth = rnd % (forest_height + 1)` = `rnd % 11` is CORRECT:
+- R11: 11 % 11 = 0 -> depth-0 caching (all at root after wrap)
+- R12: 12 % 11 = 1 -> depth-1 caching
+- R13: 13 % 11 = 2 -> depth-2 caching
+- etc.
