@@ -1,0 +1,127 @@
+Optimization Ideas - VLIW Tree Traversal Kernel
+Current: 2,499 cycles | Target: <1,600 cycles | Baseline: 147,734 cycles
+Speedup: 59.12x
+
+================================================================================
+IMPLEMENTED METHODS (Sorted by impact)
+================================================================================
+| # | Method                           | Cycles Saved | Status      |
+|---|----------------------------------|--------------|-------------|
+| 1 | ListScheduler for VLIW bundling  | (foundation) | DONE        |
+| 2 | 6-way batched hash               | ~1000+       | DONE        |
+| 3 | Arithmetic direction (val%2+1)   | ~500         | DONE        |
+| 4 | LOAD+VALU pipelining             | ~600         | DONE        |
+| 5 | Skip wrap when depth < height    | ~500         | DONE        |
+| 6 | Direct add for gather ALU        | ~200         | DONE        |
+| 7 | Combined ALU+prefetch scheduler  | ~172         | DONE (NEW)  |
+| 8 | Cross-round pipelining           | ~160         | DONE (NEW)  |
+| 9 | Arithmetic vselect (unique=2)    | ~90          | DONE        |
+| 10| 12-way for vselect rounds        | ~40          | DONE        |
+| 11| multiply_add for index           | ~36          | DONE        |
+| 12| 4-way init/final batching        | ~24          | DONE (NEW)  |
+| 13| Single broadcast (unique=1)      | ~12          | DONE        |
+
+================================================================================
+RECENT SESSION PROGRESS
+================================================================================
+Started:  2,855 cycles
+After ALU+prefetch combining:  2,683 cycles (-172)
+After cross-round pipelining: 2,523 cycles (-160)
+After 4-way init/final:       2,499 cycles (-24)
+Total saved this session:     356 cycles (12.5% improvement)
+
+================================================================================
+BOTTLENECK ANALYSIS
+================================================================================
+| Engine | Slots | Usage              | Bottleneck? | Notes                    |
+|--------|-------|--------------------|-------------|--------------------------|
+| VALU   | 6     | ~100% with 6-way   | Primary     | Hash is 576 ops/round    |
+| LOAD   | 2     | Pipelined          | Secondary   | 128 cycles/direct round  |
+| FLOW   | 1     | Mostly eliminated  | Minimal     | Only R10 wrap + rare     |
+| ALU    | 12    | Now in scheduler   | No          | Overlapped with VALU     |
+| STORE  | 2     | Final only         | No          | Just 8 vstores now       |
+
+================================================================================
+REMAINING OPTIMIZATIONS (Priority order)
+================================================================================
+
+1. VSELECT->DIRECT CROSS-ROUND PIPELINING
+   Status: NOT WORKING (index bounds issues)
+   Est. Savings: ~40 cycles (2 transitions)
+   Challenge: Indices may exceed tree bounds after vselect rounds
+
+2. LARGER LAST GROUP BATCHES
+   Status: NOT IMPLEMENTED
+   Est. Savings: ~50 cycles
+   Complexity: Medium
+   Need more register groups for 12-way last group processing
+
+3. SCHEDULER OPTIMIZATION
+   Status: POTENTIAL
+   Est. Savings: Unknown
+   Could the ListScheduler be improved for better op packing?
+
+================================================================================
+ARCHITECTURE SUMMARY
+================================================================================
+VLEN = 8 (vector length)
+SCRATCH_SIZE = 1536 words
+Rounds = 16, Batch = 256 walkers (32 chunks of 8)
+
+Per-cycle limits:
+  ALU:   12 ops (scalar arithmetic)
+  VALU:   6 ops (vector arithmetic, hash, XOR)
+  LOAD:   2 ops (load, vload, const)
+  STORE:  2 ops (store, vstore)
+  FLOW:   1 op  (select, vselect)
+
+================================================================================
+CYCLE BREAKDOWN (REVISED ESTIMATE)
+================================================================================
+
+Direct Load Rounds (12 of 16):
+  - First group gather (non-pipelined):  28 cycles × 2 rounds = 56 cycles
+  - First group gather (pipelined):       0 cycles × 10 rounds
+  - 5 middle groups (fully pipelined):  140 cycles × 12 rounds = 1680 cycles
+  - Last group + next prefetch:          28 cycles × 10 rounds = 280 cycles
+  - Last group (final round):            22 cycles × 2 rounds = 44 cycles
+  - Direct Load Subtotal:               ~2060 cycles
+
+Vselect Rounds (4 of 16):
+  - unique_count=1 (R0, R11):           110 cycles each = 220 cycles
+  - unique_count=2 (R1, R12):           130 cycles each = 260 cycles
+  - Subtotal:                           480 cycles
+
+Overhead:
+  - Init (80 cycles) + Final (40 cycles) = 120 cycles
+
+TOTAL ESTIMATE: ~2660 cycles
+ACTUAL:         2,499 cycles (better than estimate due to good scheduling)
+
+================================================================================
+THEORETICAL LIMITS
+================================================================================
+
+VALU-bound (all ops):
+  32 chunks x (1 XOR + 18 hash + 3 index + ~1 selection) x 16 rounds
+  = 32 x 23 x 16 = 11,776 ops / 6 = 1,963 cycles minimum
+
+LOAD-bound (direct rounds):
+  32 chunks x 8 loads x 12 direct rounds / 2 LOAD slots = 1,536 cycles
+
+Target <1,600 is BELOW theoretical VALU minimum!
+This suggests either:
+  1. Target is unachievable with current algorithm
+  2. There's a fundamentally different approach needed
+
+================================================================================
+KEY FUNCTIONS (in perf_takehome.py)
+================================================================================
+
+ListScheduler                      - VLIW scheduler with auto dependency detection
+emit_gather_batched                - Gather with ALU+LOAD overlap
+emit_compute_with_prefetch         - Compute with ALU+VALU+LOAD overlap (NEW!)
+emit_last_group_with_next_gather   - Cross-round pipelining (NEW!)
+emit_xor_hash_index_nway_scheduled - N-way XOR+hash+index via ListScheduler
+emit_xor_hash_index_broadcast      - Optimized for unique_count=1
+emit_fused_unique2_complete        - Fused selection+XOR+hash for unique_count=2
